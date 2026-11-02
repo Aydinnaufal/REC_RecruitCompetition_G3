@@ -1,0 +1,6 @@
+// Robot Station V 7.0 tuning values: paste into the robot firmware
+const int MIN_PWM = 154;
+const bool INVERT_LEFT = false, INVERT_RIGHT = false;
+servo 1 limits: 0 .. 75 degrees
+servo 2 limits: 0 .. 180 degrees
+const float VBAT_RATIO = 3.1277;

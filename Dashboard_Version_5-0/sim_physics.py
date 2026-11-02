@@ -82,6 +82,7 @@ class Cube:
         self.held = False
         self.pinned = False            # touching something that cannot move this step
         self.dx = self.dy = 0.0        # how far it was pushed this step (becomes its velocity)
+        self.px, self.py = x, y        # position at the start of the step (a cube resting on this one is carried by the difference)
         self.home = (x, y)
 
     def obb(self):
@@ -89,7 +90,9 @@ class Cube:
 
 
 class World:
-    def __init__(self, drop_height=10.0):
+    def __init__(self, drop_height=10.0, pillar_h=PILLAR_H, stacking=False):
+        self.pillar_h = pillar_h
+        self.stacking = stacking       # True: a cube whose centre is over another cube rests on it (v3 tower robot)
         self.statics = []
         self.pillars = []
         self.cubes = []
@@ -115,14 +118,14 @@ class World:
         for sgn in (1, -1):
             for px in PILLAR_XS:
                 for py in PILLAR_YS:
-                    p = OBB(sgn * px, sgn * py, PILLAR_W / 2, PILLAR_W / 2, 0.0, 0.0, PILLAR_H, 'pillar')
+                    p = OBB(sgn * px, sgn * py, PILLAR_W / 2, PILLAR_W / 2, 0.0, 0.0, self.pillar_h, 'pillar')
                     S.append(p); self.pillars.append(p)
 
     def support_height(self, x, y):
         """Height of whatever a cube centred at (x, y) rests on: a pillar top if the centre is over a pillar, else the floor."""
         for p in self.pillars:
             if abs(x - p.cx) <= p.hx and abs(y - p.cy) <= p.hy:
-                return PILLAR_H
+                return self.pillar_h
         return 0.0
 
     def reset_cubes(self):
@@ -132,7 +135,7 @@ class World:
             for py in PILLAR_YS:
                 for px in PILLAR_XS:
                     n += 1
-                    self.cubes.append(Cube(n, team, sgn * px, sgn * py, PILLAR_H + self.drop_height))
+                    self.cubes.append(Cube(n, team, sgn * px, sgn * py, self.pillar_h + self.drop_height))
         for c in self.cubes:
             c.home = (c.x, c.y)
 
@@ -140,18 +143,55 @@ class World:
         return [c for c in self.cubes if not c.held]
 
     # ---- one physics step
+    def mark(self):
+        """Remember where every cube is at the start of a step (cubes resting on another cube are carried by how far it moved)."""
+        for c in self.cubes:
+            c.px, c.py = c.x, c.y
+
+    def support_of(self, c):
+        """(height, base) of whatever the cube c rests on: floor, pillar top, or (stacking) the top of a cube under its centre."""
+        h, base = self.support_height(c.x, c.y), None
+        if self.stacking:
+            for o in self.cubes:
+                if o is c or o.z + CUBE_S > c.z + 0.05:
+                    continue
+                if abs(c.x - o.x) <= CUBE_S / 2 and abs(c.y - o.y) <= CUBE_S / 2 and o.z + CUBE_S > h:
+                    h, base = o.z + CUBE_S, o
+        return h, base
+
     def step_cubes(self, dt):
         """Gravity, friction and landing for every free cube. Call after resolve(). A cube that was pushed this step already moved
-        (resolve moved it), so its velocity is taken from the push; any other cube moves by its own velocity."""
-        for c in self.free_cubes():
+        (resolve moved it), so its velocity is taken from the push; any other cube moves by its own velocity.
+        With stacking on, a cube resting on another one is carried with it."""
+        for c in sorted(self.free_cubes(), key=lambda q: q.z) if self.stacking else self.free_cubes():
             pushed = bool(c.dx or c.dy)
+            if self.stacking:
+                on = getattr(c, 'on', None)
+                if on is not None and on.held:
+                    c.x, c.y = on.x + c.off[0], on.y + c.off[1]       # the cube under it is held (lifted by the robot): it rides along
+                    c.z, c.vz = on.z + CUBE_S, 0.0
+                    c.dx = c.dy = 0.0
+                    c.vx = c.vy = 0.0
+                    continue
+                sup, base = self.support_of(c)
+                c.on = base
+                if base is not None: c.off = (c.x - base.x, c.y - base.y)
+            else:
+                sup, base = self.support_height(c.x, c.y), None
+            if base is not None and c.z <= sup + 0.05 and c.vz >= -1e-9:       # resting on a cube: it moves with that cube
+                if not pushed:
+                    c.x += base.x - base.px
+                    c.y += base.y - base.py
+                c.z, c.vz = sup, 0.0
+                c.dx = c.dy = 0.0
+                c.vx = c.vy = 0.0
+                continue
             if pushed:
                 vx, vy = c.dx / dt, c.dy / dt
                 sp = math.hypot(vx, vy)
                 if sp > 90.0: vx, vy = vx * 90.0 / sp, vy * 90.0 / sp
                 c.vx, c.vy = vx, vy
             c.dx = c.dy = 0.0
-            sup = self.support_height(c.x, c.y)
             if c.z > sup + 1e-6 or c.vz != 0.0:                # in the air: falling
                 c.vz -= G * dt
                 c.z += c.vz * dt
@@ -244,7 +284,8 @@ HOLD_TIME = 0.0        # both arms touching a cube (while the claw is closing) c
 class Claw:
     """Two arms. angle[side] in degrees from straight ahead, positive = swung inwards (toward the centre line)."""
 
-    def __init__(self):
+    def __init__(self, hinge=ARM_HINGE, hinge_y=ARM_HINGE_Y, length=ARM_LEN, z0=ARM_Z0, z1=ARM_Z1):
+        self.hinge, self.hinge_y, self.length, self.z0, self.z1 = hinge, hinge_y, length, z0, z1    # v3 moves the claw: same class, other numbers
         self.cmd = 0.0                       # LT, 0 open .. 1 closed
         self.reset()
 
@@ -259,19 +300,18 @@ class Claw:
     def target_deg(lt):
         return OPEN_DEG + clamp(lt, 0.0, 1.0) * (CLOSED_DEG - OPEN_DEG)
 
-    @staticmethod
-    def arm_local(side, deg):
+    def arm_local(self, side, deg):
         """Arm box in the robot frame: (cx, cy, hx, hy, angle). side -1 = left, +1 = right."""
         b = math.radians(deg)
-        hx = side * ARM_HINGE
+        hx = side * self.hinge
         # left arm points forward and swings toward +x; right arm toward -x
         ang = math.pi / 2 - b if side < 0 else math.pi / 2 + b
-        cx, cy = hx + math.cos(ang) * ARM_LEN / 2, ARM_HINGE_Y + math.sin(ang) * ARM_LEN / 2
-        return cx, cy, ARM_LEN / 2, ARM_T / 2, ang
+        cx, cy = hx + math.cos(ang) * self.length / 2, self.hinge_y + math.sin(ang) * self.length / 2
+        return cx, cy, self.length / 2, ARM_T / 2, ang
 
     def arm_obb(self, rob, side, deg=None):
         cx, cy, hx, hy, a = self.arm_local(side, deg if deg is not None else self.ang[side])
-        return OBB(*rob.to_world(cx, cy), hx, hy, a + rob.th, ARM_Z0, ARM_Z1, ('arm', side))
+        return OBB(*rob.to_world(cx, cy), hx, hy, a + rob.th, self.z0, self.z1, ('arm', side))
 
     # ---- motion
     def move_arms(self, rob, dt):
